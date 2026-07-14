@@ -12,8 +12,12 @@
 Thumbs.db
 Desktop.ini
 
-# 编辑器目录
+# 编辑器与本地工具目录
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
+
+# Rust 构建产物
+target/

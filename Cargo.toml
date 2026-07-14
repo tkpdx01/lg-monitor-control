@@ -1,0 +1,39 @@
+[package]
+name = "lg-monitor-control"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A polished Windows utility for switching monitor inputs over DDC/CI"
+repository = "https://github.com/tkpdx01/lg-monitor-control"
+
+[dependencies]
+crossbeam-channel = "0.5"
+directories = "6.0"
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow"] }
+global-hotkey = "0.8"
+raw-window-handle = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tray-icon = { version = "0.24", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+libloading = "0.8"
+windows = { version = "0.62", features = [
+    "Win32_Devices_Display",
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
