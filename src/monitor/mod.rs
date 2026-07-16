@@ -2,7 +2,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[cfg(windows)]
+mod lg_cdc;
+#[cfg(windows)]
+mod lg_ddc;
+#[cfg(windows)]
 mod lg_intel;
+#[cfg(windows)]
+mod lg_usb;
 #[cfg(windows)]
 mod windows;
 
@@ -45,6 +51,15 @@ pub enum SwitchOutcome {
     AlternateCommandSent,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputCycleReport {
+    pub before: u32,
+    pub requested: u32,
+    pub after_target: Option<u32>,
+    pub restore_command_accepted: bool,
+    pub after_restore: Option<u32>,
+}
+
 #[derive(Debug, Error)]
 pub enum MonitorError {
     #[cfg(windows)]
@@ -56,6 +71,9 @@ pub enum MonitorError {
     #[cfg(windows)]
     #[error("Monitor '{0}' is no longer available")]
     NotFound(String),
+    #[cfg(windows)]
+    #[error("Monitor '{0}' stopped reporting its current input before the test started")]
+    InputUnavailable(String),
     #[cfg(windows)]
     #[error(
         "Monitor accepted input 0x{requested:02X}, but still reports 0x{reported:02X}; verify the port's VCP value and disable Auto Input in the monitor OSD"
@@ -102,6 +120,13 @@ pub(crate) fn model_from_capabilities(capabilities: &str) -> Option<String> {
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .map(str::to_owned)
+}
+
+pub(crate) fn is_lg_private_input_model(model: Option<&str>) -> bool {
+    model.is_some_and(|model| {
+        let model = model.to_ascii_uppercase();
+        model.contains("WK95U") || model.contains("BK95U")
+    })
 }
 
 pub(crate) fn inputs_from_capabilities(capabilities: &str) -> Option<Vec<u32>> {
@@ -193,6 +218,458 @@ pub fn run_helper_command() -> Option<i32> {
 }
 
 #[cfg(windows)]
+pub fn run_cli_command() -> Option<i32> {
+    let mut arguments = std::env::args().skip(1);
+    match arguments.next().as_deref() {
+        Some("--list-monitors") => Some(match scan_monitors() {
+            Ok(monitors) => {
+                for (index, monitor) in monitors.iter().enumerate() {
+                    println!(
+                        "[{index}] id={:?} device={:?} description={:?} model={} current={} maximum={} inputs={} ddc={}",
+                        monitor.id,
+                        monitor.device_name,
+                        monitor.description,
+                        monitor.model.as_deref().unwrap_or("unknown"),
+                        format_optional_hex(monitor.current_input),
+                        format_optional_hex(monitor.maximum_input),
+                        monitor
+                            .supported_inputs
+                            .as_deref()
+                            .map(format_hex_values)
+                            .unwrap_or_else(|| "unknown".into()),
+                        monitor.ddc_supported,
+                    );
+                }
+                println!("lg_usb_control={}", lg_usb::is_available());
+                println!("lg_cdc_control={}", lg_cdc::is_available());
+                0
+            }
+            Err(error) => {
+                eprintln!("Monitor scan failed: {error}");
+                1
+            }
+        }),
+        Some("--switch-input") => {
+            let Some(monitor_index) = arguments
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+            else {
+                eprintln!("Usage: --switch-input <monitor-index> <hex-or-decimal-input>");
+                return Some(2);
+            };
+            let Some(input) = arguments.next().and_then(|value| parse_cli_value(&value)) else {
+                eprintln!("Usage: --switch-input <monitor-index> <hex-or-decimal-input>");
+                return Some(2);
+            };
+
+            Some(match scan_monitors() {
+                Ok(monitors) => {
+                    let Some(monitor) = monitors.get(monitor_index) else {
+                        eprintln!(
+                            "Monitor index {monitor_index} does not exist; {} monitor(s) were found.",
+                            monitors.len()
+                        );
+                        return Some(2);
+                    };
+                    println!(
+                        "Switching monitor {:?} ({}) from {} to 0x{input:02X}",
+                        monitor.description,
+                        monitor.model.as_deref().unwrap_or("unknown"),
+                        format_optional_hex(monitor.current_input),
+                    );
+                    match set_input(&monitor.id, input) {
+                        Ok(outcome) => {
+                            println!("Switch outcome: {outcome:?}");
+                            0
+                        }
+                        Err(error) => {
+                            eprintln!("Switch failed: {error}");
+                            1
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Monitor scan failed: {error}");
+                    1
+                }
+            })
+        }
+        Some("--lg-usb-alt") => {
+            let Some(value) = arguments
+                .next()
+                .and_then(|value| parse_cli_value(&value))
+                .and_then(|value| u8::try_from(value).ok())
+            else {
+                eprintln!("Usage: --lg-usb-alt <hex-or-decimal-private-input>");
+                return Some(2);
+            };
+
+            Some(match lg_usb::send_input(value) {
+                Ok(response) => {
+                    if let Some(error) = response.response_error {
+                        eprintln!(
+                            "LG USB command value=0x{value:02X} bytes_written={} response=unavailable ({error})",
+                            response.bytes_written,
+                        );
+                        1
+                    } else {
+                        println!(
+                            "LG USB command value=0x{value:02X} bytes_written={} response={}",
+                            response.bytes_written,
+                            format_hex_bytes(&response.response),
+                        );
+                        0
+                    }
+                }
+                Err(error) => {
+                    eprintln!("LG USB command failed: {error}");
+                    1
+                }
+            })
+        }
+        Some("--lg-cdc-get") => {
+            let Some(vcp_code) = arguments
+                .next()
+                .and_then(|value| parse_cli_value(&value))
+                .and_then(|value| u8::try_from(value).ok())
+            else {
+                eprintln!("Usage: --lg-cdc-get <hex-or-decimal-vcp-code>");
+                return Some(2);
+            };
+
+            Some(match lg_cdc::get_vcp(vcp_code) {
+                Ok(response) => {
+                    println!(
+                        "LG CDC get vcp=0x{vcp_code:02X} port={} bytes_written={} response={}",
+                        response.port_name,
+                        response.bytes_written,
+                        format_hex_bytes(&response.response),
+                    );
+                    0
+                }
+                Err(error) => {
+                    eprintln!("LG CDC get failed: {error}");
+                    1
+                }
+            })
+        }
+        Some("--lg-cdc-set") => {
+            let Some(vcp_code) = arguments
+                .next()
+                .and_then(|value| parse_cli_value(&value))
+                .and_then(|value| u8::try_from(value).ok())
+            else {
+                eprintln!("Usage: --lg-cdc-set <vcp-code> <value>");
+                return Some(2);
+            };
+            let Some(value) = arguments
+                .next()
+                .and_then(|value| parse_cli_value(&value))
+                .and_then(|value| u16::try_from(value).ok())
+            else {
+                eprintln!("Usage: --lg-cdc-set <vcp-code> <value>");
+                return Some(2);
+            };
+
+            Some(match lg_cdc::set_vcp(vcp_code, value) {
+                Ok(response) => {
+                    println!(
+                        "LG CDC set vcp=0x{vcp_code:02X} value=0x{value:04X} port={} bytes_written={} response={}",
+                        response.port_name,
+                        response.bytes_written,
+                        format_hex_bytes(&response.response),
+                    );
+                    0
+                }
+                Err(error) => {
+                    eprintln!("LG CDC set failed: {error}");
+                    1
+                }
+            })
+        }
+        Some("--lg-cdc-alt") => {
+            let Some(value) = arguments
+                .next()
+                .and_then(|value| parse_cli_value(&value))
+                .and_then(|value| u16::try_from(value).ok())
+            else {
+                eprintln!("Usage: --lg-cdc-alt <hex-or-decimal-private-input>");
+                return Some(2);
+            };
+
+            Some(match lg_cdc::set_vcp(lg_ddc::LG_INPUT_VCP_CODE, value) {
+                Ok(response) => {
+                    println!(
+                        "LG CDC alt value=0x{value:04X} port={} bytes_written={} response={}",
+                        response.port_name,
+                        response.bytes_written,
+                        format_hex_bytes(&response.response),
+                    );
+                    0
+                }
+                Err(error) => {
+                    eprintln!("LG CDC alt failed: {error}");
+                    1
+                }
+            })
+        }
+        Some("--lg-cdc-raw") => {
+            let payload = arguments
+                .filter_map(|value| {
+                    parse_cli_value(&value).and_then(|value| u8::try_from(value).ok())
+                })
+                .collect::<Vec<_>>();
+            if payload.is_empty() {
+                eprintln!("Usage: --lg-cdc-raw <payload-byte> [payload-byte...]");
+                return Some(2);
+            }
+
+            Some(match lg_cdc::send_raw(&payload) {
+                Ok(response) => {
+                    println!(
+                        "LG CDC raw payload={} port={} bytes_written={} response={}",
+                        format_hex_bytes(&payload),
+                        response.port_name,
+                        response.bytes_written,
+                        format_hex_bytes(&response.response),
+                    );
+                    0
+                }
+                Err(error) => {
+                    eprintln!("LG CDC raw failed: {error}");
+                    1
+                }
+            })
+        }
+        Some("--lg-usb-cycle") => {
+            let Some(target) = arguments
+                .next()
+                .and_then(|value| parse_cli_value(&value))
+                .and_then(|value| u8::try_from(value).ok())
+            else {
+                eprintln!("Usage: --lg-usb-cycle <target> <restore>");
+                return Some(2);
+            };
+            let Some(restore) = arguments
+                .next()
+                .and_then(|value| parse_cli_value(&value))
+                .and_then(|value| u8::try_from(value).ok())
+            else {
+                eprintln!("Usage: --lg-usb-cycle <target> <restore>");
+                return Some(2);
+            };
+
+            Some(match lg_usb::cycle_inputs(target, restore) {
+                Ok(()) => {
+                    println!(
+                        "LG USB cycle target=0x{target:02X} restore=0x{restore:02X} completed"
+                    );
+                    0
+                }
+                Err(error) => {
+                    eprintln!("LG USB cycle failed: {error}");
+                    1
+                }
+            })
+        }
+        Some("--lg-intel-elevated-cycle") => {
+            let Some(target) = arguments
+                .next()
+                .and_then(|value| parse_cli_value(&value))
+                .and_then(|value| u8::try_from(value).ok())
+            else {
+                eprintln!("Usage: --lg-intel-elevated-cycle <target> <restore>");
+                return Some(2);
+            };
+            let Some(restore) = arguments
+                .next()
+                .and_then(|value| parse_cli_value(&value))
+                .and_then(|value| u8::try_from(value).ok())
+            else {
+                eprintln!("Usage: --lg-intel-elevated-cycle <target> <restore>");
+                return Some(2);
+            };
+
+            Some(match lg_intel::request_elevated_cycle(target, restore) {
+                Ok(()) => {
+                    println!(
+                        "LG Intel cycle target=0x{target:02X} restore=0x{restore:02X} completed"
+                    );
+                    0
+                }
+                Err(error) => {
+                    eprintln!("LG Intel cycle failed: {error}");
+                    1
+                }
+            })
+        }
+        Some("--lg-intel-elevated-vcp") => {
+            let Some(vcp_code) = arguments
+                .next()
+                .and_then(|value| parse_cli_value(&value))
+                .and_then(|value| u8::try_from(value).ok())
+            else {
+                eprintln!("Usage: --lg-intel-elevated-vcp <vcp-code> <value>");
+                return Some(2);
+            };
+            let Some(value) = arguments
+                .next()
+                .and_then(|value| parse_cli_value(&value))
+                .and_then(|value| u16::try_from(value).ok())
+            else {
+                eprintln!("Usage: --lg-intel-elevated-vcp <vcp-code> <value>");
+                return Some(2);
+            };
+
+            Some(match lg_intel::request_elevated_vcp(vcp_code, value) {
+                Ok(()) => {
+                    println!("LG Intel VCP vcp=0x{vcp_code:02X} value=0x{value:04X} completed");
+                    0
+                }
+                Err(error) => {
+                    eprintln!("LG Intel VCP failed: {error}");
+                    1
+                }
+            })
+        }
+        Some("--lg-intel-elevated-vcp-cycle") => {
+            let Some(vcp_code) = arguments
+                .next()
+                .and_then(|value| parse_cli_value(&value))
+                .and_then(|value| u8::try_from(value).ok())
+            else {
+                eprintln!("Usage: --lg-intel-elevated-vcp-cycle <vcp-code> <target> <restore>");
+                return Some(2);
+            };
+            let Some(target) = arguments
+                .next()
+                .and_then(|value| parse_cli_value(&value))
+                .and_then(|value| u16::try_from(value).ok())
+            else {
+                eprintln!("Usage: --lg-intel-elevated-vcp-cycle <vcp-code> <target> <restore>");
+                return Some(2);
+            };
+            let Some(restore) = arguments
+                .next()
+                .and_then(|value| parse_cli_value(&value))
+                .and_then(|value| u16::try_from(value).ok())
+            else {
+                eprintln!("Usage: --lg-intel-elevated-vcp-cycle <vcp-code> <target> <restore>");
+                return Some(2);
+            };
+
+            Some(
+                match lg_intel::request_elevated_vcp_cycle(vcp_code, target, restore) {
+                    Ok(()) => {
+                        println!(
+                            "LG Intel VCP cycle vcp=0x{vcp_code:02X} target=0x{target:04X} restore=0x{restore:04X} completed"
+                        );
+                        0
+                    }
+                    Err(error) => {
+                        eprintln!("LG Intel VCP cycle failed: {error}");
+                        1
+                    }
+                },
+            )
+        }
+        Some("--cycle-input") => {
+            let Some(monitor_index) = arguments
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+            else {
+                eprintln!("Usage: --cycle-input <monitor-index> <hex-or-decimal-input>");
+                return Some(2);
+            };
+            let Some(input) = arguments.next().and_then(|value| parse_cli_value(&value)) else {
+                eprintln!("Usage: --cycle-input <monitor-index> <hex-or-decimal-input>");
+                return Some(2);
+            };
+
+            Some(match scan_monitors() {
+                Ok(monitors) => {
+                    let Some(monitor) = monitors.get(monitor_index) else {
+                        eprintln!(
+                            "Monitor index {monitor_index} does not exist; {} monitor(s) were found.",
+                            monitors.len()
+                        );
+                        return Some(2);
+                    };
+                    match windows::cycle_standard_input(&monitor.id, input) {
+                        Ok(report) => {
+                            println!(
+                                "Cycle before=0x{:02X} requested=0x{:02X} after_target={} restore_command={} after_restore={}",
+                                report.before,
+                                report.requested,
+                                format_optional_hex(report.after_target),
+                                report.restore_command_accepted,
+                                format_optional_hex(report.after_restore),
+                            );
+                            if report.after_restore == Some(report.before) {
+                                0
+                            } else {
+                                eprintln!(
+                                    "The original input could not be verified after the cycle."
+                                );
+                                1
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("Input cycle failed: {error}");
+                            1
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Monitor scan failed: {error}");
+                    1
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(not(windows))]
+pub fn run_cli_command() -> Option<i32> {
+    None
+}
+
+fn parse_cli_value(value: &str) -> Option<u32> {
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .and_then(|value| u32::from_str_radix(value, 16).ok())
+        .or_else(|| value.parse().ok())
+}
+
+fn format_optional_hex(value: Option<u32>) -> String {
+    value
+        .map(|value| format!("0x{value:02X}"))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn format_hex_bytes(values: &[u8]) -> String {
+    if values.is_empty() {
+        return "none".into();
+    }
+
+    values
+        .iter()
+        .map(|value| format!("{value:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_hex_values(values: &[u32]) -> String {
+    values
+        .iter()
+        .map(|value| format!("0x{value:02X}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(windows)]
 pub fn scan_monitors() -> Result<Vec<MonitorInfo>, MonitorError> {
     windows::scan_monitors()
 }
@@ -215,6 +692,13 @@ pub fn set_input(_monitor_id: &str, _input: u32) -> Result<SwitchOutcome, Monito
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_cli_input_values() {
+        assert_eq!(parse_cli_value("0x10"), Some(0x10));
+        assert_eq!(parse_cli_value("17"), Some(17));
+        assert_eq!(parse_cli_value("HDMI"), None);
+    }
 
     #[test]
     fn formats_known_and_custom_input_names() {
@@ -251,5 +735,13 @@ mod tests {
                     .any(|other| other.value == input.value)
             );
         }
+    }
+
+    #[test]
+    fn identifies_lg_private_input_models() {
+        assert!(is_lg_private_input_model(Some("WK95U")));
+        assert!(is_lg_private_input_model(Some("34BK95U-W")));
+        assert!(!is_lg_private_input_model(Some("UN880")));
+        assert!(!is_lg_private_input_model(None));
     }
 }

@@ -21,3 +21,8 @@ Desktop.ini
 
 # Rust 构建产物
 target/
+
+# 本地逆向/发布临时产物
+.analysis/
+dist/
+*.obj

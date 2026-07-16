@@ -23,6 +23,10 @@ fn main() -> eframe::Result {
         std::process::exit(exit_code);
     }
 
+    if let Some(exit_code) = monitor::run_cli_command() {
+        std::process::exit(exit_code);
+    }
+
     let Some(_single_instance) = system::acquire_single_instance() else {
         return Ok(());
     };

@@ -7,7 +7,9 @@ use eframe::egui::{
 };
 
 use crate::config::{Accent, ConfigStore};
-use crate::monitor::{InputPreset, MonitorInfo, SwitchOutcome, default_inputs, input_name};
+use crate::monitor::{
+    InputPreset, MonitorInfo, SwitchOutcome, default_inputs, input_name, is_lg_private_input_model,
+};
 use crate::system::{SystemAction, SystemIntegration};
 use crate::theme::{self, Theme};
 use crate::worker::{MonitorWorker, WorkerEvent};
@@ -290,7 +292,9 @@ impl MonitorControlApp {
             return;
         }
         let input_label = input_name_for_model(input, monitor.model.as_deref());
-        if monitor.current_input == Some(input) {
+        if reported_input_is_reliable(monitor.model.as_deref())
+            && monitor.current_input == Some(input)
+        {
             self.toast(ToastKind::Info, format!("Already using {input_label}"));
             return;
         }
@@ -758,10 +762,17 @@ impl MonitorControlApp {
             .data
             .alias_for(&monitor.id, &detected_name)
             .to_owned();
-        let current_input = monitor
-            .current_input
-            .map(input_name)
-            .unwrap_or_else(|| "Unavailable".into());
+        let lg_private_input = is_lg_private_input_model(monitor.model.as_deref());
+        let current_input = match monitor.current_input {
+            Some(input) if lg_private_input => {
+                format!(
+                    "Reported {}",
+                    input_name_for_model(input, monitor.model.as_deref())
+                )
+            }
+            Some(input) => input_name_for_model(input, monitor.model.as_deref()),
+            None => "Unavailable".into(),
+        };
         let inputs = self.inputs_for_monitor(monitor);
 
         Frame::new()
@@ -792,6 +803,14 @@ impl MonitorControlApp {
                                     theme::with_alpha(theme.danger, 24)
                                 },
                             );
+                            if lg_private_input {
+                                status_chip(
+                                    ui,
+                                    "LG ALT",
+                                    theme.accent_bright,
+                                    theme.accent_soft,
+                                );
+                            }
                         });
                         ui.label(
                             RichText::new(format!("{}  ·  {}", monitor.device_name, monitor.description))
@@ -831,6 +850,13 @@ impl MonitorControlApp {
                                 }
                                 _ => "VCP 0x60 did not return a readable value".to_owned(),
                             };
+                            let vcp_details = if lg_private_input {
+                                format!(
+                                    "{vcp_details}. LG WK95U/BK95U input switching uses a private write-only path, so this reported value can be stale."
+                                )
+                            } else {
+                                vcp_details
+                            };
                             ui.label(
                                 RichText::new(&current_input)
                                     .size(15.0)
@@ -860,7 +886,8 @@ impl MonitorControlApp {
 
                 ui.horizontal_wrapped(|ui| {
                     for (index, input) in inputs.iter().enumerate() {
-                        let active = monitor.current_input == Some(input.value);
+                        let active =
+                            !lg_private_input && monitor.current_input == Some(input.value);
                         let fill = if active { theme.accent_soft } else { theme.elevated };
                         let stroke = if active { theme.accent_bright } else { theme.border };
                         let prefix = if input.favorite { "• " } else { "" };
@@ -986,6 +1013,12 @@ impl MonitorControlApp {
                     .map(|instant| format!("Updated {}s ago", instant.elapsed().as_secs()))
                     .unwrap_or_else(|| "Waiting for first scan".into());
                 ui.label(RichText::new(status).size(10.0).color(theme.muted));
+                ui.separator();
+                ui.label(
+                    RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .size(10.0)
+                        .color(theme.muted),
+                );
             });
         });
     }
@@ -1124,16 +1157,15 @@ fn available_inputs(
 }
 
 fn input_name_for_model(value: u32, model: Option<&str>) -> String {
-    let is_wk95u_family = model.is_some_and(|model| {
-        let model = model.to_ascii_uppercase();
-        model.contains("WK95U") || model.contains("BK95U")
-    });
-
-    if value == 0x10 && is_wk95u_family {
+    if value == 0x10 && is_lg_private_input_model(model) {
         "Thunderbolt / USB-C".into()
     } else {
         input_name(value)
     }
+}
+
+fn reported_input_is_reliable(model: Option<&str>) -> bool {
+    !is_lg_private_input_model(model)
 }
 
 fn input_sort_key(value: u32) -> (u8, u32) {
@@ -1326,5 +1358,11 @@ mod tests {
 
         assert!(inputs.iter().any(|input| input.value == 0xd0));
         assert!(!inputs.iter().any(|input| input.value == 0x1b));
+    }
+
+    #[test]
+    fn treats_lg_private_input_report_as_unreliable() {
+        assert!(!reported_input_is_reliable(Some("WK95U")));
+        assert!(reported_input_is_reliable(Some("UN880")));
     }
 }

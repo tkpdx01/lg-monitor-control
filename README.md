@@ -17,7 +17,7 @@
 - 全局快捷键
 - DDC/CI 操作在专用后台线程执行，不阻塞界面
 - 写入后回读、重试和结果验证，避免把“API 返回成功但显示器忽略命令”误报为成功
-- 针对 LG WK95U/BK95U 的 Intel IGCL 私有通道回退
+- 针对 LG WK95U/BK95U 的 USB HID / Intel IGCL 私有通道回退
 - 配置只保存在本机，不需要网络服务或账号
 
 ## 快捷键
@@ -41,6 +41,7 @@
 - 支持 DDC/CI 的显示器
 - 已在显示器 OSD 菜单中启用 DDC/CI
 - 建议使用显示器与显卡之间的直连线缆
+- 使用 LG USB 私有通道时，需要把显示器的 USB upstream 接到当前电脑
 
 以下设备可能阻断或改写 DDC/CI：
 
@@ -93,9 +94,10 @@ Windows 的 `SetVCPFeature` 无法指定 source address，因此不能直接访�
 1. 先通过标准 VCP `0x60` 写入。
 2. 等待显示器完成切换并回读验证。
 3. 如果显示器连续返回旧输入，应用会尝试 LG 私有通道。
-4. 当显示器挂在 Intel 显卡上时，应用通过 Intel Graphics Control Library 的 `ctlI2CAccess` 发送 `0x50/0xF4` 命令。
-5. 私有写入需要管理员权限；只有触发该回退时才显示 UAC，不要求整个应用始终以管理员身份运行。
-6. 命令会发送两次，中间等待 1.2 秒，以兼容需要先唤醒 DDC 通道的 LG 固件。
+4. 如果检测到 LG USB 控制设备 `043E:9A39`，应用会先尝试通过 USB HID bridge 发送 `0x50/0xF4` 命令。
+5. 否则，当显示器挂在 Intel 显卡上时，应用通过 Intel Graphics Control Library 的 `ctlI2CAccess` 发送同一条 `0x50/0xF4` 命令。
+6. Intel 私有写入需要管理员权限；只有触发该回退时才显示 UAC，不要求整个应用始终以管理员身份运行。
+7. Intel 命令会发送两次，中间等待 1.2 秒，以兼容需要先唤醒 DDC 通道的 LG 固件。
 
 WK95U/BK95U 当前使用以下私有映射：
 
@@ -107,6 +109,22 @@ WK95U/BK95U 当前使用以下私有映射：
 | HDMI 2 `0x12` | `0x91` |
 
 私有通道是 write-only，无法像标准 VCP 一样回读确认。应用会明确显示“已发送 LG alternate command”，而不会伪造已验证成功的当前输入状态。
+
+Intel IGCL 原始 I²C 路径向 DDC 写地址 `0x6E` 发送完整 DDC/CI SetVCP 帧，`Offset` 保持 `0`：
+
+```text
+50 84 03 F4 00 <private-input> <xor-checksum>
+```
+
+其中 checksum 对 `6E 50 84 03 F4 00 <private-input>` 做 XOR。LG USB HID bridge 使用同一条 SetVCP 语义，但 bridge payload 的 length byte 不带 DDC/CI control flag：
+
+```text
+50 04 03 F4 00 <private-input> <xor-checksum>
+```
+
+如果 USB bridge 只返回空 I²C payload，应用会继续尝试 Intel IGCL，而不会把“写入 HID report 成功”误报为输入已切换。
+
+本项目对 WK95U 的实测结论记录在 [LG WK95U Input Switching Notes](docs/lg-wk95u-protocol.md)。
 
 Intel 回退要求 Intel 驱动提供：
 
@@ -176,8 +194,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 - capabilities string 可能不完整甚至不准确，因此应用允许添加自定义输入值。
 - 切到另一台电脑后，原电脑可能不再能访问显示器的 DDC 通道；要从另一台电脑切回来，需要在那台电脑上运行兼容工具。
 - LG 私有通道可能只接受来自当前活动输入的命令。
+- WK95U/BK95U 通过 LG 私有通道切换后，标准 `VCP 0x60` 读数可能继续报告旧输入；应用会把该读数标记为 reported，而不会用它拦截后续切换。
 - Dock、KVM 或转换器可能让输入读取成功但写入失败。
-- 当前没有已发布的安装程序；请从源码构建 release executable。
+- 当前 release 提供免安装 zip 包，不包含代码签名安装程序。
 
 ## 技术栈
 
@@ -195,6 +214,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 - [ddcutil: Switching input source on LG monitors](https://github.com/rockowitz/ddcutil/wiki/Switching-input-source-on-LG-monitors)
 - [ddcutil issue #100](https://github.com/rockowitz/ddcutil/issues/100)
 - [Windows + Intel IGCL LG input switch](https://github.com/Jason7536/lg-input-switch)
+- [LG USB HID control reverse engineering](https://github.com/shinyquagsire23/lg_display_manager)
 - [Windows + NVIDIA NVAPI raw I²C example](https://github.com/kaleb422/NVapi-write-value-to-monitor)
 - [LG 34WK95U-W ddccontrol-db issue](https://github.com/ddccontrol/ddccontrol-db/issues/147)
 - [LG 34WK95U-W ddccontrol-db profile](https://github.com/ddccontrol/ddccontrol-db/pull/231)

@@ -20,7 +20,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tray-icon = { version = "0.24", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
+hidapi = { version = "2.6", default-features = false, features = ["windows-native"] }
 libloading = "0.8"
+serialport = "4.7"
 windows = { version = "0.62", features = [
     "Win32_Devices_Display",
     "Win32_Foundation",

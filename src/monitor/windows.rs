@@ -15,8 +15,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::core::BOOL;
 
 use super::{
-    INPUT_SOURCE_VCP_CODE, MonitorError, MonitorInfo, SwitchOutcome, inputs_from_capabilities,
-    model_from_capabilities,
+    INPUT_SOURCE_VCP_CODE, InputCycleReport, MonitorError, MonitorInfo, SwitchOutcome,
+    inputs_from_capabilities, is_lg_private_input_model, model_from_capabilities,
 };
 
 struct PhysicalMonitorBatch(Vec<PHYSICAL_MONITOR>);
@@ -168,9 +168,9 @@ pub(super) fn set_input(target_id: &str, input: u32) -> Result<SwitchOutcome, Mo
                         model = model.as_deref().unwrap_or("unknown"),
                         standard_input = format_args!("0x{input:02X}"),
                         alternate_input = format_args!("0x{alternate_input:02X}"),
-                        "Falling back to the LG Intel alternate input channel"
+                        "Falling back to an LG alternate input channel"
                     );
-                    super::lg_intel::request_elevated_switch(alternate_input)
+                    send_lg_alternate_input(alternate_input)
                         .map_err(MonitorError::AlternateInput)?;
                     return Ok(SwitchOutcome::AlternateCommandSent);
                 }
@@ -180,6 +180,103 @@ pub(super) fn set_input(target_id: &str, input: u32) -> Result<SwitchOutcome, Mo
                     reported: last_reported.unwrap_or_default(),
                 });
             }
+        }
+    }
+
+    Err(MonitorError::NotFound(target_id.to_owned()))
+}
+
+pub(super) fn cycle_standard_input(
+    target_id: &str,
+    input: u32,
+) -> Result<InputCycleReport, MonitorError> {
+    let logical_monitors = enumerate_logical_monitors()?;
+
+    for (logical_index, logical_monitor) in logical_monitors.into_iter().enumerate() {
+        let device_name = monitor_device_name(logical_monitor)
+            .unwrap_or_else(|| format!("DISPLAY{}", logical_index + 1));
+        let batch = match physical_monitors(logical_monitor) {
+            Ok(batch) => batch,
+            Err(error) => {
+                tracing::warn!(%error, %device_name, "Unable to open logical monitor for cycle test");
+                continue;
+            }
+        };
+
+        for (physical_index, physical) in batch.0.iter().enumerate() {
+            let handle = unsafe { addr_of!(physical.hPhysicalMonitor).read_unaligned() };
+            let description_buffer =
+                unsafe { addr_of!(physical.szPhysicalMonitorDescription).read_unaligned() };
+            let description = wide_string(&description_buffer);
+            let description = if description.trim().is_empty() {
+                format!("Physical monitor {}", physical_index + 1)
+            } else {
+                description
+            };
+
+            if monitor_id(&device_name, physical_index, &description) != target_id {
+                continue;
+            }
+
+            let before = read_input(handle)
+                .map(|(current, _)| current)
+                .ok_or_else(|| MonitorError::InputUnavailable(target_id.to_owned()))?;
+            if before == input {
+                return Ok(InputCycleReport {
+                    before,
+                    requested: input,
+                    after_target: Some(before),
+                    restore_command_accepted: true,
+                    after_restore: Some(before),
+                });
+            }
+
+            let mut target_command_accepted = false;
+            let mut after_target = Some(before);
+            for _ in 0..2 {
+                target_command_accepted |=
+                    unsafe { SetVCPFeature(handle, INPUT_SOURCE_VCP_CODE, input) != 0 };
+                if !target_command_accepted {
+                    return Err(last_error("setting the cycle target input"));
+                }
+
+                thread::sleep(Duration::from_millis(1_500));
+                after_target = read_input(handle).map(|(current, _)| current);
+                if after_target == Some(input) || after_target.is_none() {
+                    break;
+                }
+            }
+
+            if after_target == Some(before) {
+                return Ok(InputCycleReport {
+                    before,
+                    requested: input,
+                    after_target,
+                    restore_command_accepted: true,
+                    after_restore: Some(before),
+                });
+            }
+
+            thread::sleep(Duration::from_millis(2_500));
+            let mut restore_command_accepted = false;
+            let mut after_restore = None;
+            for _ in 0..3 {
+                restore_command_accepted |=
+                    unsafe { SetVCPFeature(handle, INPUT_SOURCE_VCP_CODE, before) != 0 };
+                thread::sleep(Duration::from_millis(1_500));
+                after_restore = read_input(handle).map(|(current, _)| current);
+                if after_restore == Some(before) {
+                    break;
+                }
+            }
+
+            return Ok(InputCycleReport {
+                before,
+                requested: input,
+                after_target,
+                restore_command_accepted,
+                after_restore,
+            });
         }
     }
 
@@ -220,8 +317,7 @@ fn read_input(handle: windows::Win32::Foundation::HANDLE) -> Option<(u32, u32)> 
 }
 
 fn lg_alternate_input(model: Option<&str>, standard_input: u32) -> Option<u8> {
-    let model = model?.to_ascii_uppercase();
-    if !model.contains("WK95U") && !model.contains("BK95U") {
+    if !is_lg_private_input_model(model) {
         return None;
     }
 
@@ -231,6 +327,44 @@ fn lg_alternate_input(model: Option<&str>, standard_input: u32) -> Option<u8> {
         0x11 => Some(0x90),
         0x12 => Some(0x91),
         _ => None,
+    }
+}
+
+fn send_lg_alternate_input(value: u8) -> Result<(), String> {
+    let mut errors = Vec::new();
+
+    if super::lg_usb::is_available() {
+        match super::lg_usb::send_input(value) {
+            Ok(response) => {
+                if let Some(error) = response.response_error {
+                    tracing::warn!(
+                        %error,
+                        bytes_written = response.bytes_written,
+                        "LG USB alternate input command did not return a usable bridge response"
+                    );
+                    errors.push(format!("USB HID: {error}"));
+                } else {
+                    tracing::info!(
+                        bytes_written = response.bytes_written,
+                        response_bytes = response.response.len(),
+                        "Sent LG alternate input command through USB HID"
+                    );
+                    return Ok(());
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "LG USB alternate input command failed");
+                errors.push(format!("USB HID: {error}"));
+            }
+        }
+    }
+
+    match super::lg_intel::request_elevated_switch(value) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            errors.push(format!("Intel IGCL: {error}"));
+            Err(errors.join("; "))
+        }
     }
 }
 

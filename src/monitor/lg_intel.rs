@@ -20,12 +20,13 @@ use windows::{
 };
 
 const CTL_RESULT_SUCCESS: i32 = 0;
-const DDC_ADDRESS: u32 = 0x6e;
-const LG_SOURCE_ADDRESS: u32 = 0x50;
-const LG_INPUT_VCP_CODE: u8 = 0xf4;
+const CTL_RESULT_ERROR_INSUFFICIENT_PERMISSIONS: i32 = 0x4000_0006;
 const DISPLAY_ATTACHED: u32 = 0x2;
 const INTERNAL_DISPLAY: u32 = 0x1;
 const HELPER_ARGUMENT: &str = "--lg-intel-alt";
+const HELPER_CYCLE_ARGUMENT: &str = "--lg-intel-cycle";
+const HELPER_VCP_ARGUMENT: &str = "--lg-intel-vcp";
+const HELPER_VCP_CYCLE_ARGUMENT: &str = "--lg-intel-vcp-cycle";
 
 const EXIT_INVALID_ARGUMENT: i32 = 2;
 const EXIT_LIBRARY_UNAVAILABLE: i32 = 3;
@@ -33,6 +34,7 @@ const EXIT_INITIALIZATION_FAILED: i32 = 4;
 const EXIT_NO_EXTERNAL_DISPLAY: i32 = 5;
 const EXIT_MULTIPLE_EXTERNAL_DISPLAYS: i32 = 6;
 const EXIT_WRITE_FAILED: i32 = 7;
+const EXIT_INSUFFICIENT_PERMISSIONS: i32 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -175,15 +177,51 @@ impl Drop for ApiHandle {
 
 pub(super) fn run_helper_command() -> Option<i32> {
     let mut arguments = std::env::args().skip(1);
-    if arguments.next().as_deref() != Some(HELPER_ARGUMENT) {
-        return None;
-    }
-
-    let Some(value) = arguments.next().and_then(|value| parse_byte(&value)) else {
-        return Some(EXIT_INVALID_ARGUMENT);
+    let operation = match arguments.next().as_deref() {
+        Some(HELPER_ARGUMENT) => {
+            let Some(value) = arguments.next().and_then(|value| parse_byte(&value)) else {
+                return Some(EXIT_INVALID_ARGUMENT);
+            };
+            send_input(value)
+        }
+        Some(HELPER_CYCLE_ARGUMENT) => {
+            let Some(target) = arguments.next().and_then(|value| parse_byte(&value)) else {
+                return Some(EXIT_INVALID_ARGUMENT);
+            };
+            let Some(restore) = arguments.next().and_then(|value| parse_byte(&value)) else {
+                return Some(EXIT_INVALID_ARGUMENT);
+            };
+            cycle_inputs(target, restore)
+        }
+        Some(HELPER_VCP_ARGUMENT) => {
+            let Some(vcp_code) = arguments.next().and_then(|value| parse_byte(&value)) else {
+                return Some(EXIT_INVALID_ARGUMENT);
+            };
+            let Some(value) = arguments.next().and_then(|value| parse_word(&value)) else {
+                return Some(EXIT_INVALID_ARGUMENT);
+            };
+            send_vcp(vcp_code, value)
+        }
+        Some(HELPER_VCP_CYCLE_ARGUMENT) => {
+            let Some(vcp_code) = arguments.next().and_then(|value| parse_byte(&value)) else {
+                return Some(EXIT_INVALID_ARGUMENT);
+            };
+            let Some(target) = arguments.next().and_then(|value| parse_word(&value)) else {
+                return Some(EXIT_INVALID_ARGUMENT);
+            };
+            let Some(restore) = arguments.next().and_then(|value| parse_word(&value)) else {
+                return Some(EXIT_INVALID_ARGUMENT);
+            };
+            cycle_vcp(vcp_code, target, restore)
+        }
+        _ => return None,
     };
 
-    Some(match send_input(value) {
+    Some(helper_exit_code(operation))
+}
+
+fn helper_exit_code(result: Result<(), HelperError>) -> i32 {
+    match result {
         Ok(()) => 0,
         Err(HelperError::LibraryUnavailable(error)) => {
             tracing::error!(%error, "Intel Graphics Control Library is unavailable");
@@ -204,6 +242,13 @@ pub(super) fn run_helper_command() -> Option<i32> {
             );
             EXIT_MULTIPLE_EXTERNAL_DISPLAYS
         }
+        Err(HelperError::Api(operation, CTL_RESULT_ERROR_INSUFFICIENT_PERMISSIONS)) => {
+            tracing::error!(
+                operation,
+                "Intel I2C access requires administrator permission"
+            );
+            EXIT_INSUFFICIENT_PERMISSIONS
+        }
         Err(HelperError::Api(operation, status)) => {
             tracing::error!(
                 operation,
@@ -212,14 +257,46 @@ pub(super) fn run_helper_command() -> Option<i32> {
             );
             EXIT_WRITE_FAILED
         }
-    })
+    }
 }
 
 pub(super) fn request_elevated_switch(value: u8) -> Result<(), String> {
+    request_elevated_helper(
+        &format!("{HELPER_ARGUMENT} 0x{value:02X}"),
+        "The elevated LG input helper did not start.",
+    )
+}
+
+pub(super) fn request_elevated_cycle(target: u8, restore: u8) -> Result<(), String> {
+    request_elevated_helper(
+        &format!("{HELPER_CYCLE_ARGUMENT} 0x{target:02X} 0x{restore:02X}"),
+        "The elevated LG input cycle helper did not start.",
+    )
+}
+
+pub(super) fn request_elevated_vcp(vcp_code: u8, value: u16) -> Result<(), String> {
+    request_elevated_helper(
+        &format!("{HELPER_VCP_ARGUMENT} 0x{vcp_code:02X} 0x{value:04X}"),
+        "The elevated LG VCP helper did not start.",
+    )
+}
+
+pub(super) fn request_elevated_vcp_cycle(
+    vcp_code: u8,
+    target: u16,
+    restore: u16,
+) -> Result<(), String> {
+    request_elevated_helper(
+        &format!("{HELPER_VCP_CYCLE_ARGUMENT} 0x{vcp_code:02X} 0x{target:04X} 0x{restore:04X}"),
+        "The elevated LG VCP cycle helper did not start.",
+    )
+}
+
+fn request_elevated_helper(parameters: &str, startup_error: &str) -> Result<(), String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("Could not locate the application executable: {error}"))?;
     let executable = wide(executable.as_os_str());
-    let parameters = wide(OsStr::new(&format!("{HELPER_ARGUMENT} 0x{value:02X}")));
+    let parameters = wide(OsStr::new(parameters));
 
     let mut execute_info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -236,7 +313,7 @@ pub(super) fn request_elevated_switch(value: u8) -> Result<(), String> {
 
     let process = execute_info.hProcess;
     if process.is_invalid() {
-        return Err("The elevated LG input helper did not start.".into());
+        return Err(startup_error.into());
     }
 
     let wait_result = unsafe { WaitForSingleObject(process, INFINITE) };
@@ -275,11 +352,42 @@ pub(super) fn request_elevated_switch(value: u8) -> Result<(), String> {
             "Intel Graphics Control Library could not send the LG alternate input command."
                 .into(),
         ),
+        EXIT_INSUFFICIENT_PERMISSIONS => Err(
+            "Intel Graphics Control Library still denied I2C access after elevation.".into(),
+        ),
         code => Err(format!("The LG alternate input helper failed with exit code {code}.")),
     }
 }
 
 fn send_input(value: u8) -> Result<(), HelperError> {
+    with_external_display(|display, i2c_access| write_input_twice(display, value, i2c_access))
+}
+
+fn send_vcp(vcp_code: u8, value: u16) -> Result<(), HelperError> {
+    with_external_display(|display, i2c_access| {
+        write_vcp_twice(display, vcp_code, value, i2c_access)
+    })
+}
+
+fn cycle_inputs(target: u8, restore: u8) -> Result<(), HelperError> {
+    with_external_display(|display, i2c_access| {
+        write_input_twice(display, target, i2c_access)?;
+        thread::sleep(Duration::from_secs(8));
+        write_input_twice(display, restore, i2c_access)
+    })
+}
+
+fn cycle_vcp(vcp_code: u8, target: u16, restore: u16) -> Result<(), HelperError> {
+    with_external_display(|display, i2c_access| {
+        write_vcp_twice(display, vcp_code, target, i2c_access)?;
+        thread::sleep(Duration::from_secs(8));
+        write_vcp_twice(display, vcp_code, restore, i2c_access)
+    })
+}
+
+fn with_external_display<T>(
+    operation: impl FnOnce(*mut c_void, CtlI2cAccess) -> Result<T, HelperError>,
+) -> Result<T, HelperError> {
     let library = unsafe { Library::new("ControlLib.dll") }
         .map_err(|error| HelperError::LibraryUnavailable(error.to_string()))?;
     let ctl_init: CtlInit = load(&library, b"ctlInit\0")?;
@@ -321,8 +429,32 @@ fn send_input(value: u8) -> Result<(), HelperError> {
         displays => return Err(HelperError::MultipleExternalDisplays(displays.len())),
     };
 
+    operation(display, i2c_access)
+}
+
+fn write_input_twice(
+    display: *mut c_void,
+    value: u8,
+    i2c_access: CtlI2cAccess,
+) -> Result<(), HelperError> {
     for attempt in 0..2 {
         write_input(display, value, i2c_access)?;
+        if attempt == 0 {
+            thread::sleep(Duration::from_millis(1_200));
+        }
+    }
+
+    Ok(())
+}
+
+fn write_vcp_twice(
+    display: *mut c_void,
+    vcp_code: u8,
+    value: u16,
+    i2c_access: CtlI2cAccess,
+) -> Result<(), HelperError> {
+    for attempt in 0..2 {
+        write_vcp(display, vcp_code, value, i2c_access)?;
         if attempt == 0 {
             thread::sleep(Duration::from_millis(1_200));
         }
@@ -393,38 +525,45 @@ fn write_input(
     value: u8,
     i2c_access: CtlI2cAccess,
 ) -> Result<(), HelperError> {
-    let length = 0x84;
-    let operation = 0x03;
-    let high = 0x00;
-    let checksum = [
-        DDC_ADDRESS as u8,
-        LG_SOURCE_ADDRESS as u8,
-        length,
-        operation,
-        LG_INPUT_VCP_CODE,
-        high,
-        value,
-    ]
-    .into_iter()
-    .fold(0, |checksum, byte| checksum ^ byte);
+    let frame = super::lg_ddc::lg_input_set_vcp_frame(value);
+    write_frame(
+        display,
+        &frame,
+        "writing the LG alternate input command",
+        i2c_access,
+    )
+}
 
+fn write_vcp(
+    display: *mut c_void,
+    vcp_code: u8,
+    value: u16,
+    i2c_access: CtlI2cAccess,
+) -> Result<(), HelperError> {
+    let frame = super::lg_ddc::lg_source_set_vcp_frame(vcp_code, value);
+    write_frame(
+        display,
+        &frame,
+        "writing the LG raw VCP command",
+        i2c_access,
+    )
+}
+
+fn write_frame(
+    display: *mut c_void,
+    frame: &[u8],
+    operation: &'static str,
+    i2c_access: CtlI2cAccess,
+) -> Result<(), HelperError> {
     let mut arguments = CtlI2cAccessArgs {
-        data_size: 6,
-        address: DDC_ADDRESS,
+        data_size: frame.len() as u32,
+        address: super::lg_ddc::DDC_WRITE_ADDRESS as u32,
         operation_type: 2,
-        offset: LG_SOURCE_ADDRESS,
         ..Default::default()
     };
-    arguments.data[..6].copy_from_slice(&[
-        length,
-        operation,
-        LG_INPUT_VCP_CODE,
-        high,
-        value,
-        checksum,
-    ]);
+    arguments.data[..frame.len()].copy_from_slice(frame);
 
-    api_call("writing the LG alternate input command", unsafe {
+    api_call(operation, unsafe {
         i2c_access(display, &raw mut arguments)
     })
 }
@@ -451,6 +590,14 @@ fn parse_byte(value: &str) -> Option<u8> {
         .or_else(|| value.parse().ok())
 }
 
+fn parse_word(value: &str) -> Option<u16> {
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .and_then(|value| u16::from_str_radix(value, 16).ok())
+        .or_else(|| value.parse().ok())
+}
+
 fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(Some(0)).collect()
 }
@@ -472,6 +619,7 @@ mod tests {
         assert_eq!(parse_byte("0xD2"), Some(0xd2));
         assert_eq!(parse_byte("144"), Some(0x90));
         assert_eq!(parse_byte("input"), None);
+        assert_eq!(parse_word("0x1234"), Some(0x1234));
     }
 
     #[test]
